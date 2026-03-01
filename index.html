@@ -49,13 +49,27 @@ pre{background:#0b1020;color:#d6e1ff;padding:8px;border-radius:8px;overflow:auto
 -->
 
 <script type="module">
-import {joinRoom} from 'https://esm.sh/trystero@0.18.0/nostr'
-
+(async()=>{
 /* ── DOM ── */
 const $=id=>document.getElementById(id);
 const logEl=$("log"),statusEl=$("status"),pcEl=$("peerCount"),mcEl=$("msgCount");
 const log=m=>{logEl.textContent=m+"\n"+logEl.textContent.slice(0,2000)};
 const ss=(t,c)=>{statusEl.textContent=t;statusEl.className="pill "+(c||"bad")};
+
+log("⏳ Loading library…");
+ss("loading…","wait");
+
+/* ── Import trystero (Nostr strategy) ── */
+let joinRoom;
+try{
+  const mod=await import('https://esm.sh/trystero@0.18.0/nostr');
+  joinRoom=mod.joinRoom;
+  log("✅ Library loaded");
+}catch(e){
+  log("❌ Failed to load library: "+e.message);
+  ss("load error");
+  return;
+}
 
 /* ── Lobby = inscription hex from URL hash ── */
 const LOBBY=decodeURIComponent((location.hash||"").replace(/^#/,""));
@@ -70,7 +84,7 @@ const peers=new Set();
 
 /* ── Tell inscription we're ready ── */
 function notifyReady(){
-  if(opener)opener.postMessage(JSON.stringify({lobby:LOBBY,type:"relay-ready"}),"*");
+  if(opener)try{opener.postMessage(JSON.stringify({lobby:LOBBY,type:"relay-ready"}),"*")}catch{}
 }
 function updateUI(){
   pcEl.textContent=peers.size;
@@ -81,8 +95,16 @@ function updateUI(){
 ss("connecting…","wait");
 log("🔍 Dialing into "+LOBBY.slice(0,16)+"…");
 
-const room=joinRoom({appId:'ordinals-arena'},LOBBY);
-const [sendGame,getGame]=room.makeAction('game');
+let room,sendGame,getGame;
+try{
+  room=joinRoom({appId:'ordinals-arena'},LOBBY);
+  [sendGame,getGame]=room.makeAction('game');
+  log("📡 Connected to Nostr relays — waiting for peers…");
+}catch(e){
+  log("❌ Failed to join room: "+e.message);
+  ss("join error");
+  return;
+}
 
 /* ── Peer events ── */
 room.onPeerJoin(peerId=>{
@@ -102,7 +124,7 @@ room.onPeerLeave(peerId=>{
 /* ── Receive game data from peers → forward to inscription ── */
 getGame((data,peerId)=>{
   msgCount++;mcEl.textContent=msgCount;
-  if(opener)opener.postMessage(JSON.stringify({lobby:LOBBY,type:"peer-msg",data}),"*");
+  if(opener)try{opener.postMessage(JSON.stringify({lobby:LOBBY,type:"peer-msg",data}),"*")}catch{}
 });
 
 /* ── Receive game data from inscription → send to all peers ── */
@@ -114,14 +136,14 @@ window.addEventListener("message",ev=>{
   if(msg.type==="ping"){notifyReady();return}
 
   /* broadcast to all peers */
-  sendGame(msg);
+  try{sendGame(msg)}catch(e){log("⚠️ Send err: "+e.message)}
   msgCount++;mcEl.textContent=msgCount;
 });
 
 /* ── Signal ready once Nostr relays connect ── */
 setTimeout(notifyReady,1500);
 setTimeout(notifyReady,3000);
-log("📡 Connecting to Nostr relays…");
+setTimeout(notifyReady,6000);
 updateUI();
 
 /* ── Minimize ── */
@@ -129,6 +151,7 @@ $("backBtn").onclick=()=>{
   try{window.resizeTo(200,80);window.moveTo(screen.width-220,screen.height-120)}catch{}
   if(window.opener)try{window.opener.focus()}catch{}
 };
+})();
 </script>
 </body>
 </html>
