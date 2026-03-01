@@ -10,7 +10,7 @@ h2{color:#f7931a;margin:0 0 4px;font-size:16px}
 .sub{opacity:.65;font-size:11px;margin:0 0 10px}
 .pill{display:inline-block;padding:3px 12px;border-radius:99px;font-size:12px;font-weight:800}
 .ok{background:#1a4d2e;color:#6fcf97}.bad{background:#4d1a1a;color:#f28b82}.wait{background:#4d3e1a;color:#f5c842}
-pre{background:#0b1020;color:#d6e1ff;padding:8px;border-radius:8px;overflow:auto;max-height:120px;font-size:10px;text-align:left;margin-top:8px}
+pre{background:#0b1020;color:#d6e1ff;padding:8px;border-radius:8px;overflow:auto;max-height:140px;font-size:10px;text-align:left;margin-top:8px}
 .minbtn{background:#f7931a;color:#000;font-weight:900;cursor:pointer;border:none;padding:14px 32px;border-radius:12px;font-size:18px;margin:12px 0;display:block;width:100%}
 .minbtn:hover{background:#ffaa33}
 .stats{font-size:12px;margin:6px 0;opacity:.8}
@@ -19,197 +19,116 @@ pre{background:#0b1020;color:#d6e1ff;padding:8px;border-radius:8px;overflow:auto
 </head>
 <body>
 <h2>⚡ P2P Game Relay</h2>
-<p class="sub">Inscription hex = phone number. Dial in & connect!</p>
+<p class="sub">Inscription hex = phone number. The internet is the network.</p>
 <span id="status" class="pill bad">offline</span>
 <div id="phone"></div>
 <div class="stats">Peers: <b id="peerCount">0</b> · Messages: <b id="msgCount">0</b></div>
 <button class="minbtn" id="backBtn">⬇ Minimize & Return</button>
 <pre id="log">…</pre>
 
-<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
-<script>
-(async()=>{
+<!--
+  HOW THIS WORKS:
+
+  The internet IS the phone network. We use what already exists:
+
+  1. Nostr relays (free, public, decentralized, Bitcoin-native)
+     → The "phone exchange" — peers publish/find each other here
+     → wss://relay.damus.io, wss://nos.lol, etc.
+
+  2. STUN servers (free, public, Google/Cloudflare run them)
+     → NAT traversal — lets peers behind routers find each other
+
+  3. WebRTC data channels
+     → The direct call — after the 2s handshake, it's pure P2P
+
+  Inscription hex = the phone number everyone dials.
+  Nostr relays = the internet's phone exchange.
+  After connecting = direct line, no middleman.
+
+  Trystero handles all the WebRTC+Nostr plumbing in one library.
+-->
+
+<script type="module">
+import {joinRoom} from 'https://esm.sh/trystero@0.18.0/nostr'
+
 /* ── DOM ── */
 const $=id=>document.getElementById(id);
-const logEl=$("log"),statusEl=$("status"),peerCountEl=$("peerCount"),msgCountEl=$("msgCount");
+const logEl=$("log"),statusEl=$("status"),pcEl=$("peerCount"),mcEl=$("msgCount");
 const log=m=>{logEl.textContent=m+"\n"+logEl.textContent.slice(0,2000)};
-const ss=(t,c)=>{statusEl.textContent=t;statusEl.className="pill "+(c||(t.includes("peer")?"ok":t.includes("…")?"wait":"bad"))};
+const ss=(t,c)=>{statusEl.textContent=t;statusEl.className="pill "+(c||"bad")};
 
-/* ── Lobby from URL hash (the inscription hex) ── */
+/* ── Lobby = inscription hex from URL hash ── */
 const LOBBY=decodeURIComponent((location.hash||"").replace(/^#/,""));
-if(!LOBBY){ss("no lobby","bad");log("❌ No inscription hex in URL hash");return}
-
-/* ── Derive deterministic room "phone number" ── */
-const hashBuf=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(LOBBY));
-const PHONE="ord-"+[...new Uint8Array(hashBuf)].map(b=>b.toString(16).padStart(2,"0")).join("").slice(0,16);
-$("phone").textContent="📞 "+PHONE;
-log("📞 Phone #: "+PHONE);
+if(!LOBBY){ss("no lobby");log("❌ No inscription hex in URL hash");return}
+$("phone").textContent="📞 "+LOBBY.slice(0,16)+"…";
+log("📞 Phone: "+LOBBY.slice(0,16)+"…");
 
 /* ── State ── */
 let opener=window.opener||((window.parent!==window)?window.parent:null);
-let peer=null,isHost=false,ready=false,msgCount=0;
-const mesh=new Map(); /* peerJsId → DataConnection */
+let msgCount=0;
+const peers=new Set();
 
-/* ── Helpers ── */
+/* ── Tell inscription we're ready ── */
 function notifyReady(){
   if(opener)opener.postMessage(JSON.stringify({lobby:LOBBY,type:"relay-ready"}),"*");
 }
-
 function updateUI(){
-  peerCountEl.textContent=mesh.size;
-  if(!ready)return;
-  ss(mesh.size?mesh.size+" peer"+(mesh.size>1?"s":""):"waiting for peers…",mesh.size?"ok":"wait");
+  pcEl.textContent=peers.size;
+  ss(peers.size?peers.size+" peer"+(peers.size>1?"s":""):"searching…",peers.size?"ok":"wait");
 }
 
-/* ── Wire up a PeerJS DataConnection ── */
-function wire(conn){
-  conn.on("open",()=>{
-    /* deduplicate */
-    if(mesh.has(conn.peer)&&mesh.get(conn.peer).open){conn.close();return}
-    mesh.set(conn.peer,conn);
-    log("✅ "+conn.peer.slice(-8)+" connected");
-    updateUI();notifyReady();
-    if(window.opener)try{window.opener.focus()}catch{}
+/* ── Join the room — inscription hex IS the room name ── */
+ss("connecting…","wait");
+log("🔍 Dialing into "+LOBBY.slice(0,16)+"…");
 
-    /* host → introduce new peer to existing mesh */
-    if(isHost){
-      const others=[...mesh.keys()].filter(id=>id!==conn.peer);
-      if(others.length)conn.send(JSON.stringify({_:"peers",ids:others}));
-    }
-  });
+const room=joinRoom({appId:'ordinals-arena'},LOBBY);
+const [sendGame,getGame]=room.makeAction('game');
 
-  conn.on("data",raw=>{
-    let d;try{d=JSON.parse(typeof raw==="string"?raw:"")}catch{return}
+/* ── Peer events ── */
+room.onPeerJoin(peerId=>{
+  peers.add(peerId);
+  log("✅ "+peerId.slice(0,8)+"… connected!");
+  updateUI();
+  notifyReady();
+  if(window.opener)try{window.opener.focus()}catch{}
+});
 
-    /* internal: peer list from host → mesh with everyone */
-    if(d._==="peers"){
-      log("📋 Mesh: connecting to "+d.ids.length+" peer(s)");
-      d.ids.forEach(id=>{
-        if(!mesh.has(id)&&peer&&id!==peer.id)
-          wire(peer.connect(id,{reliable:true,serialization:"none"}));
-      });
-      return;
-    }
+room.onPeerLeave(peerId=>{
+  peers.delete(peerId);
+  log("❌ "+peerId.slice(0,8)+"… left");
+  updateUI();
+});
 
-    /* game data → forward to inscription */
-    msgCount++;msgCountEl.textContent=msgCount;
-    if(opener)opener.postMessage(JSON.stringify({lobby:LOBBY,type:"peer-msg",data:d}),"*");
-  });
+/* ── Receive game data from peers → forward to inscription ── */
+getGame((data,peerId)=>{
+  msgCount++;mcEl.textContent=msgCount;
+  if(opener)opener.postMessage(JSON.stringify({lobby:LOBBY,type:"peer-msg",data}),"*");
+});
 
-  conn.on("close",()=>{
-    mesh.delete(conn.peer);
-    log("❌ "+conn.peer.slice(-8)+" left");
-    updateUI();
-
-    /* host dropped — try to reconnect or take over */
-    if(conn.peer===PHONE&&!isHost){
-      log("👑 Host left — reconnecting in a moment…");
-      setTimeout(()=>{
-        if(peer&&peer.open){
-          const c=peer.connect(PHONE,{reliable:true,serialization:"none"});
-          wire(c);
-        }
-      },1500+Math.random()*2000);
-    }
-  });
-
-  conn.on("error",e=>log("⚠️ "+conn.peer.slice(-8)+": "+e.type));
-}
-
-/* ── postMessage bridge (inscription ↔ mesh) ── */
+/* ── Receive game data from inscription → send to all peers ── */
 window.addEventListener("message",ev=>{
   let msg;try{msg=typeof ev.data==="string"?JSON.parse(ev.data):ev.data}catch{return}
   if(!msg||msg.lobby!==LOBBY)return;
   if(ev.source)opener=ev.source;
 
-  if(msg.type==="ping"){if(ready)notifyReady();return}
+  if(msg.type==="ping"){notifyReady();return}
 
-  /* forward game message to every mesh peer */
-  const s=JSON.stringify(msg);
-  for(const[,c]of mesh)if(c.open){try{c.send(s);msgCount++;msgCountEl.textContent=msgCount}catch{}}
+  /* broadcast to all peers */
+  sendGame(msg);
+  msgCount++;mcEl.textContent=msgCount;
 });
 
-/* ── Claim the phone number (become host) ── */
-function claimHost(){
-  return new Promise(resolve=>{
-    peer=new Peer(PHONE,{debug:0});
-    let done=false;
-
-    peer.on("open",()=>{
-      if(done)return;done=true;
-      isHost=true;ready=true;
-      log("👑 First caller — you're the host");
-      ss("waiting for peers…","wait");
-      notifyReady();resolve(true);
-    });
-
-    peer.on("connection",c=>wire(c));
-
-    peer.on("error",e=>{
-      if(done)return;done=true;
-      if(e.type==="unavailable-id")log("📞 Someone already hosting. Joining…");
-      else log("⚠️ "+e.type);
-      resolve(false);
-    });
-
-    peer.on("disconnected",()=>{
-      if(isHost){log("⚠️ Signal lost — reconnecting…");try{peer.reconnect()}catch{}}
-    });
-
-    setTimeout(()=>{if(!done){done=true;resolve(false)}},8000);
-  });
-}
-
-/* ── Dial in as a regular peer ── */
-function dial(){
-  if(peer)try{peer.destroy()}catch{}
-  peer=new Peer(undefined,{debug:0});
-
-  peer.on("open",id=>{
-    ready=true;
-    log("🔗 Your ID: "+id.slice(-8));
-    log("📞 Calling host…");
-    ss("connecting…","wait");
-    notifyReady();
-    wire(peer.connect(PHONE,{reliable:true,serialization:"none"}));
-  });
-
-  peer.on("connection",c=>wire(c)); /* mesh peers connecting to us */
-
-  peer.on("error",e=>{
-    if(e.type==="peer-unavailable"){
-      log("📞 No host found — becoming host…");
-      claimHost().then(ok=>{if(!ok)setTimeout(dial,3000)});
-    }else log("⚠️ "+e.type);
-  });
-
-  peer.on("disconnected",()=>{log("⚠️ Signal lost — reconnecting…");try{peer.reconnect()}catch{}});
-}
-
-/* ── Periodic: re-discover host if we lost them ── */
-setInterval(()=>{
-  if(isHost||!peer||!peer.open)return;
-  /* if not connected to host, try again */
-  if(!mesh.has(PHONE)){
-    log("🔄 Re-dialing host…");
-    wire(peer.connect(PHONE,{reliable:true,serialization:"none"}));
-  }
-},15000);
-
-/* ── Cleanup ── */
-window.addEventListener("beforeunload",()=>{if(peer)try{peer.destroy()}catch{}});
+/* ── Signal ready once Nostr relays connect ── */
+setTimeout(notifyReady,1500);
+setTimeout(notifyReady,3000);
+log("📡 Connecting to Nostr relays…");
+updateUI();
 
 /* ── Minimize ── */
 $("backBtn").onclick=()=>{
   try{window.resizeTo(200,80);window.moveTo(screen.width-220,screen.height-120)}catch{}
   if(window.opener)try{window.opener.focus()}catch{}
 };
-
-/* ── GO: dial the phone number ── */
-ss("dialing…","wait");
-log("🔍 Dialing "+LOBBY.slice(0,16)+"…");
-if(!await claimHost())dial();
-})();
 </script>
 </body>
 </html>
